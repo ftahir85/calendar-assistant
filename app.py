@@ -7,6 +7,7 @@ Run with:  python -m streamlit run app.py --server.fileWatcherType none
 import os
 import json
 import datetime as dt
+import pytz
 import streamlit as st
 
 from langgraph.graph import StateGraph, END
@@ -23,6 +24,7 @@ load_dotenv()
 
 SCOPES   = ["https://www.googleapis.com/auth/calendar"]
 TIMEZONE = "Asia/Karachi"
+KARACHI  = pytz.timezone("Asia/Karachi")
 llm      = ChatOpenAI(model="gpt-4o-mini", temperature=0)
 
 @st.cache_resource
@@ -82,8 +84,11 @@ def find_slots(busy_blocks, search_start, search_end, meeting_minutes, work_star
     return slots
 
 def list_upcoming(service, days=1, max_results=10):
-    now    = dt.datetime.now(dt.timezone.utc).isoformat()
-    future = (dt.datetime.now(dt.timezone.utc) + dt.timedelta(days=days)).isoformat()
+    today_start = dt.datetime.now(dt.timezone.utc).replace(
+        hour=0, minute=0, second=0, microsecond=0
+    )
+    now    = today_start.isoformat()
+    future = (today_start + dt.timedelta(days=days)).isoformat()
     result = service.events().list(
         calendarId="primary", timeMin=now, timeMax=future,
         maxResults=max_results, singleEvents=True, orderBy="startTime"
@@ -99,9 +104,11 @@ def create_event(service, summary, start_dt, end_dt):
     return service.events().insert(calendarId="primary", body=body).execute()
 
 def delete_event_by_search(service, query):
-    now    = dt.datetime.now(dt.timezone.utc).isoformat()
+    today_start = dt.datetime.now(dt.timezone.utc).replace(
+        hour=0, minute=0, second=0, microsecond=0
+    ).isoformat()
     result = service.events().list(
-        calendarId="primary", q=query, timeMin=now,
+        calendarId="primary", q=query, timeMin=today_start,
         maxResults=5, singleEvents=True, orderBy="startTime"
     ).execute()
     items = result.get("items", [])
@@ -110,6 +117,107 @@ def delete_event_by_search(service, query):
     event = items[0]
     service.events().delete(calendarId="primary", eventId=event["id"]).execute()
     return event.get("summary"), "Deleted successfully."
+
+def render_day_schedule(service, target_date):
+    """
+    Renders a visual 9am-6pm schedule bar for a given date.
+    Green = free, Red = busy. Weekend = grey with message.
+    """
+    WORK_START = 9
+    WORK_END   = 18
+    TOTAL_MINS = (WORK_END - WORK_START) * 60  # 540 minutes
+
+    if target_date.weekday() >= 5:
+        day_name = "Saturday" if target_date.weekday() == 5 else "Sunday"
+        st.markdown(f"""
+        <div style="background:#1a2035;border-radius:8px;padding:12px;margin-bottom:8px;text-align:center;">
+            <div style="color:#8892a4;font-size:0.8rem;">📅 {target_date.strftime('%a %d %b')}</div>
+            <div style="color:#e8c46a;font-size:0.78rem;margin-top:6px;">🏖️ Weekend — No slots available</div>
+        </div>
+        """, unsafe_allow_html=True)
+        return
+
+    day_start_utc = KARACHI.localize(
+        dt.datetime.combine(target_date, dt.time(WORK_START, 0))
+    ).astimezone(dt.timezone.utc)
+    day_end_utc = KARACHI.localize(
+        dt.datetime.combine(target_date, dt.time(WORK_END, 0))
+    ).astimezone(dt.timezone.utc)
+
+    try:
+        busy = get_busy_blocks(service, day_start_utc, day_end_utc)
+    except Exception:
+        busy = []
+
+    # Build segments: list of (start_pct, width_pct, is_busy, label)
+    segments = []
+    work_s   = KARACHI.localize(dt.datetime.combine(target_date, dt.time(WORK_START, 0)))
+    work_e   = KARACHI.localize(dt.datetime.combine(target_date, dt.time(WORK_END,   0)))
+    cursor   = work_s
+
+    busy_local = []
+    for bs, be in busy:
+        bs_local = bs.astimezone(KARACHI)
+        be_local = be.astimezone(KARACHI)
+        bs_local = max(bs_local, work_s)
+        be_local = min(be_local, work_e)
+        if be_local > bs_local:
+            busy_local.append((bs_local, be_local))
+    busy_local.sort(key=lambda x: x[0])
+
+    for bs, be in busy_local:
+        if bs > cursor:
+            gap_mins  = (bs - cursor).seconds // 60
+            gap_pct   = gap_mins / TOTAL_MINS * 100
+            segments.append((gap_pct, "free",
+                             f"{cursor.strftime('%I:%M %p')}–{bs.strftime('%I:%M %p')}"))
+        busy_mins = (be - bs).seconds // 60
+        busy_pct  = busy_mins / TOTAL_MINS * 100
+        segments.append((busy_pct, "busy",
+                         f"{bs.strftime('%I:%M %p')}–{be.strftime('%I:%M %p')}"))
+        cursor = be
+
+    if cursor < work_e:
+        rem_mins = (work_e - cursor).seconds // 60
+        rem_pct  = rem_mins / TOTAL_MINS * 100
+        segments.append((rem_pct, "free",
+                         f"{cursor.strftime('%I:%M %p')}–{work_e.strftime('%I:%M %p')}"))
+
+    # Build HTML bar
+    bar_html = '<div style="display:flex;width:100%;height:18px;border-radius:4px;overflow:hidden;margin:6px 0;">'
+    for pct, kind, _ in segments:
+        color = "#2d6a4f" if kind == "free" else "#c1121f"
+        bar_html += f'<div style="width:{pct:.1f}%;background:{color};"></div>'
+    bar_html += "</div>"
+
+    # Time labels
+    labels_html = '<div style="display:flex;justify-content:space-between;font-size:0.65rem;color:#8892a4;">'
+    for h in range(WORK_START, WORK_END + 1, 3):
+        labels_html += f'<span>{h:02d}:00</span>'
+    labels_html += "</div>"
+
+    # Legend items
+    legend_parts = []
+    for pct, kind, label in segments:
+        if pct > 3:
+            icon  = "🟢" if kind == "free" else "🔴"
+            legend_parts.append(f'<span style="font-size:0.7rem;color:#8892a4;">{icon} {label}</span>')
+    legend_html = '<div style="display:flex;flex-wrap:wrap;gap:4px;margin-top:4px;">' + \
+                  "".join(legend_parts) + "</div>"
+
+    now_karachi = dt.datetime.now(KARACHI)
+    is_today    = target_date == now_karachi.date()
+    date_label  = f"📅 Today — {target_date.strftime('%a %d %b')}" if is_today else f"📅 {target_date.strftime('%a %d %b')}"
+
+    st.markdown(f"""
+    <div style="background:#1a2035;border-radius:8px;padding:10px 12px;margin-bottom:8px;">
+        <div style="color:#7eb8f7;font-size:0.8rem;font-weight:600;">{date_label}</div>
+        {bar_html}
+        {labels_html}
+        {legend_html}
+    </div>
+    """, unsafe_allow_html=True)
+
 
 class CalState(TypedDict, total=False):
     user_message : str
@@ -161,7 +269,7 @@ User message: {msg}"""
 
 def calendar_node(state: CalState) -> CalState:
     service = state["service"]
-    today   = dt.datetime.now().strftime("%Y-%m-%d %H:%M")
+    today   = dt.datetime.now(KARACHI).strftime("%Y-%m-%d %H:%M")
     raw     = llm.invoke(EXTRACT_PROMPT.format(today=today, msg=state["user_message"]))
     try:
         params = json.loads(raw.content.strip())
@@ -175,19 +283,47 @@ def calendar_node(state: CalState) -> CalState:
         days       = max(1, int(params.get("days_ahead", 3)))
         work_start = int(params.get("work_start", 9))
         work_end   = int(params.get("work_end", 18))
-        now        = dt.datetime.now().astimezone()
-        # Always search at least 24h ahead to avoid empty time range
-        end        = max(
+
+        now = dt.datetime.now(KARACHI)
+
+        # Weekend check
+        if now.weekday() >= 5 and days <= 1:
+            day_name       = "Saturday" if now.weekday() == 5 else "Sunday"
+            days_to_monday = 7 - now.weekday()
+            monday         = (now + dt.timedelta(days=days_to_monday)).strftime("%a %d %b")
+            return {**state, "slots": [], "answer": (
+                f"📅 Today is **{day_name}** — no meeting slots on weekends.\n\n"
+                f"Next available slots: **Monday {monday}**.\n\n"
+                f"Try: *'Find me a free slot this week'* or *'Find me a free slot on Monday'*"
+            )}
+
+        # If past 6pm, start from tomorrow
+        if now.hour >= 18:
+            tomorrow = (now + dt.timedelta(days=1)).date()
+            now = KARACHI.localize(dt.datetime.combine(tomorrow, dt.time(0, 0)))
+
+        # If weekend, extend to reach Monday
+        if now.weekday() >= 5:
+            days = max(days, 3)
+
+        end = max(
             now + dt.timedelta(days=days),
             now + dt.timedelta(hours=24)
         )
+
         try:
             busy = get_busy_blocks(service, now, end)
         except Exception:
             busy = []
+
         slots = find_slots(busy, now, end, mins, work_start, work_end)
+
+        now_check = dt.datetime.now(KARACHI)
+        slots = [s for s in slots if s[0] > now_check + dt.timedelta(minutes=5)]
+
         if not slots:
-            return {**state, "slots": [], "answer": f"No free {mins}-min slots found. Try a wider range."}
+            return {**state, "slots": [], "answer": f"No free {mins}-min slots found. Try asking for slots this week."}
+
         lines  = [f"{i+1}. {s.strftime('%a %d %b, %I:%M %p')} – {e.strftime('%I:%M %p')}" for i, (s, e) in enumerate(slots)]
         answer = f"Found **{len(slots)}** available slot(s):\n\n" + "\n\n".join(lines)
         answer += "\n\n👉 Use the **Book a slot** panel on the left to pick one."
@@ -207,12 +343,12 @@ def calendar_node(state: CalState) -> CalState:
         days   = max(1, int(params.get("days_ahead", 1)))
         events = list_upcoming(service, days=days)
         if not events:
-            return {**state, "answer": f"No events in the next {days} day(s)."}
+            return {**state, "answer": f"No events found today or in the next {days} day(s)."}
         lines = []
         for e in events:
             raw_start = e["start"].get("dateTime", e["start"].get("date"))
             try:
-                dt_obj    = dt.datetime.fromisoformat(raw_start.replace("Z", "+00:00")).astimezone()
+                dt_obj    = dt.datetime.fromisoformat(raw_start.replace("Z", "+00:00")).astimezone(KARACHI)
                 raw_start = dt_obj.strftime("%a %d %b, %I:%M %p")
             except Exception:
                 pass
@@ -221,7 +357,7 @@ def calendar_node(state: CalState) -> CalState:
 
     elif action == "delete":
         title, msg = delete_event_by_search(service, params.get("query", ""))
-        answer = f"🗑️ Deleted **{title}**." if title else f"Couldn't find '{params.get('query')}'."
+        answer = f"🗑️ Deleted **{title}**." if title else f"Couldn't find '{params.get('query')}'. Check the exact name in the sidebar."
         return {**state, "answer": answer}
 
     return {**state, "answer": "Not sure what to do. Try: find a slot, book, view, or delete."}
@@ -298,18 +434,33 @@ with st.sidebar:
             title      = st.text_input("Meeting title", value="Meeting")
             if st.button("✅ Book this slot"):
                 s, e = st.session_state.found_slots[chosen_idx]
-                st.session_state.messages.append({"role": "user", "content": f"Book a meeting called '{title}' from {s.isoformat()} to {e.isoformat()}"})
+                msg  = f"Book a meeting called '{title}' from {s.isoformat()} to {e.isoformat()}"
+                st.session_state.messages.append({"role": "user", "content": msg})
                 st.session_state.found_slots = []
                 st.rerun()
         else:
             st.caption("Ask me to find available slots first.")
+        st.markdown("---")
+
+        # ── Visual availability panel ──────────
+        st.markdown("### 📊 Availability (9am–6pm)")
+        today_karachi = dt.datetime.now(KARACHI).date()
+        for i in range(3):
+            render_day_schedule(service, today_karachi + dt.timedelta(days=i))
+
+        st.markdown("""
+        <div style="display:flex;gap:12px;margin-top:4px;font-size:0.72rem;color:#8892a4;">
+            <span>🟢 Free</span><span>🔴 Busy</span><span>🏖️ Weekend</span>
+        </div>
+        """, unsafe_allow_html=True)
+
         st.markdown("---")
         st.markdown("### Upcoming (3 days)")
         try:
             for ev in list_upcoming(service, days=3, max_results=6):
                 raw = ev["start"].get("dateTime", ev["start"].get("date"))
                 try:
-                    raw = dt.datetime.fromisoformat(raw.replace("Z", "+00:00")).astimezone().strftime("%a %d %b, %I:%M %p")
+                    raw = dt.datetime.fromisoformat(raw.replace("Z", "+00:00")).astimezone(KARACHI).strftime("%a %d %b, %I:%M %p")
                 except Exception: pass
                 st.markdown(f'<div class="event-card"><div class="event-title">{ev.get("summary","(no title)")}</div><div class="event-time">{raw}</div></div>', unsafe_allow_html=True)
         except Exception:
@@ -326,7 +477,6 @@ for msg in st.session_state.messages:
 
 user_input = st.chat_input("e.g. 'Find me a free slot tomorrow' or 'What's on my calendar today?'")
 
-# Process typed input OR button-triggered messages
 pending_input = None
 if user_input:
     pending_input = user_input
